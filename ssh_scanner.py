@@ -90,7 +90,7 @@ TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 LOG_FILE  = f"{LOG_DIR}/ssh_scan_{TIMESTAMP}.log"
 LOG_VULN  = f"{LOG_DIR}/ssh_scan_{TIMESTAMP}_vulneraveis.txt"
 LOG_CSV   = f"{LOG_DIR}/ssh_scan_{TIMESTAMP}_resultados.csv"
-LOG_CERT  = f"{LOG_DIR}/ssh_scan_{TIMESTAMP}_formato_estruturado.txt"
+LOG_CERT  = f"{LOG_DIR}/ssh_scan_{TIMESTAMP}_formato_estruturado.csv"
 
 _log_lock = threading.Lock()
 
@@ -306,6 +306,50 @@ def parse_openssh_version(banner: str) -> str | None:
         return match.group(1)
     return None
 
+def detect_ssh_software(banner: str) -> tuple:
+    """
+    Identifica o fabricante/software SSH e extrai nome + versão do servidor.
+    Retorna (fabricante, server_name, server_version).
+    Ex: 'SSH-2.0-OpenSSH_9.7'              → ('OpenSSH',  'OpenSSH',   '9.7')
+        'SSH-2.0-ROSSSH'                    → ('Mikrotik', 'ROSSSH',    'N/D')
+        'SSH-2.0-Cisco-1.25'               → ('Cisco',    'Cisco',     '1.25')
+        'SSH-2.0-dropbear_2022.83'         → ('Dropbear', 'dropbear',  '2022.83')
+        'SSH-2.0-OpenSSH_9.3 FreeBSD-...' → ('OpenSSH',  'OpenSSH',   '9.3')
+    """
+    # Extrai a parte do software após SSH-2.0- (ou SSH-1.x-)
+    match_sw = re.match(r"SSH-[\d.]+-(.+)", banner)
+    raw = match_sw.group(1).strip() if match_sw else banner
+
+    # Tenta extrair nome_software e versão no formato Nome_versão ou Nome-versão
+    match_ver = re.match(r"([A-Za-z][A-Za-z0-9\-\.]+)[_\-]([\d][\d\.p\-a-zA-Z]*)", raw)
+    if match_ver:
+        sw_name = match_ver.group(1)
+        sw_ver  = match_ver.group(2)
+    else:
+        sw_name = raw.split()[0]  # pega só o primeiro token
+        sw_ver  = "N/D"
+
+    # Mapeamento de fabricante pelo nome do software
+    fabricante_map = {
+        "openssh":   "OpenSSH",
+        "rosssh":    "Mikrotik",
+        "cisco":     "Cisco",
+        "dropbear":  "Dropbear",
+        "libssh":    "libssh",
+        "bitvise":   "Bitvise",
+        "paramiko":  "Paramiko",
+        "asyncssh":  "AsyncSSH",
+        "huawei":    "Huawei",
+        "junos":     "Juniper",
+        "vshell":    "VShell",
+        "wolfsssh":  "wolfSSH",
+        "cryptlib":  "cryptlib",
+    }
+    fabricante = fabricante_map.get(sw_name.lower(), sw_name)
+
+    return fabricante, sw_name, sw_ver
+
+
 def _normalize_ver(ver_str: str) -> str:
     """Normaliza versão OpenSSH para comparação (ex: 9.8p1 → 9.8.1, 9.6 → 9.6.0)."""
     ver_str = ver_str.strip()
@@ -359,9 +403,10 @@ def scan_ip_ssh(ip: str, hostname: str, ports: list, timeout: float) -> dict | N
         if banner is None:
             continue
 
-        openssh_ver = parse_openssh_version(banner)
+        openssh_ver   = parse_openssh_version(banner)
+        fabricante, sw_name, sw_ver = detect_ssh_software(banner)
         affected_cves = check_cves(openssh_ver) if openssh_ver else []
-        status = classify_host(banner, openssh_ver, affected_cves)
+        status        = classify_host(banner, openssh_ver, affected_cves)
 
         return {
             "ip":            ip,
@@ -369,6 +414,9 @@ def scan_ip_ssh(ip: str, hostname: str, ports: list, timeout: float) -> dict | N
             "hostname":      hostname,
             "banner":        banner,
             "openssh_ver":   openssh_ver or "N/D",
+            "fabricante":    fabricante,
+            "sw_name":       sw_name,
+            "sw_ver":        sw_ver,
             "affected_cves": affected_cves,
             "status":        status,
             "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -379,20 +427,20 @@ def scan_ip_ssh(ip: str, hostname: str, ports: list, timeout: float) -> dict | N
 # =============================================================================
 # Formatação estruturada de saída
 # =============================================================================
-def format_cert_line(res: dict) -> str:
-    """
-    Gera linha estruturada com IP, porta, timestamp, domínio e detalhes.
-    IP | Porta | Timestamp (UTC) | Dominio | Detalhes
-    """
-    cves_str  = ";".join(res["affected_cves"]).lower()
-    detalhes  = f"{cves_str};ssh;{res['banner']}" if cves_str else f"ssh;{res['banner']}"
-    return (
-        f"{res['ip']:<16} | "
-        f"{res['port']:<5} | "
-        f"{res['timestamp_utc']:<20} | "
-        f"{res['hostname']:<35} | "
-        f"{detalhes}"
-    )
+def format_cert_row(res: dict) -> dict:
+    """Gera dict para linha CSV estruturada."""
+    cves_str = ";".join(res["affected_cves"]).lower()
+    return {
+        "IP":           res["ip"],
+        "PORTA":        res["port"],
+        "TIMESTAMP_UTC":res["timestamp_utc"],
+        "DOMINIO":      res["hostname"],
+        "FABRICANTE":   res["fabricante"],
+        "SW_NAME":      res["sw_name"],
+        "SW_VERSAO":    res["sw_ver"],
+        "CVEs":         cves_str,
+        "BANNER":       res["banner"],
+    }
 
 
 # =============================================================================
@@ -503,22 +551,15 @@ def main():
             sys.exit(0)
 
     # Inicializa arquivos de saída
-    cert_header = (
-        f"# SSH Scanner — Saída Estruturada | {TIMESTAMP}\n"
-        f"# CVEs: CVE-2024-6387 (regreSSHion) | CVE-2023-48795 (Terrapin)\n"
-        f"#\n"
-        f"{'IP':<16} | {'Porta':<5} | {'Timestamp (UTC)':<20} | {'Dominio':<35} | Detalhes\n"
-        f"{'─'*16}-+-{'─'*5}-+-{'─'*20}-+-{'─'*35}-+-{'─'*50}\n"
-    )
-    with open(LOG_CERT, "w", encoding="utf-8") as f:
-        f.write(cert_header)
+    with open(LOG_CERT, "w", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=["IP", "PORTA", "TIMESTAMP_UTC", "DOMINIO", "FABRICANTE", "SW_NAME", "SW_VERSAO", "CVEs", "BANNER"]).writeheader()
 
     with open(LOG_VULN, "w", encoding="utf-8") as f:
         f.write(f"# SSH VULNERÁVEL | {TIMESTAMP}\n")
         f.write(f"{'IP':<16} {'PORTA':<6} {'HOSTNAME':<38} {'VERSÃO':<12} {'CVEs':<35} STATUS\n")
         f.write(f"{'='*16} {'='*6} {'='*38} {'='*12} {'='*35} {'='*20}\n")
 
-    fieldnames = ["IP", "PORTA", "HOSTNAME", "BANNER", "VERSAO_OPENSSH", "CVEs", "STATUS", "TIMESTAMP_UTC"]
+    fieldnames = ["IP", "PORTA", "HOSTNAME", "FABRICANTE", "SW_NAME", "SW_VERSAO", "BANNER", "VERSAO_OPENSSH", "CVEs", "STATUS", "TIMESTAMP_UTC"]
     with open(LOG_CSV, "w", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=fieldnames).writeheader()
 
@@ -576,15 +617,15 @@ def main():
                 banner   = res["banner"]
                 cves_str = ";".join(cves) if cves else "—"
 
-                info = f"{ip:<15} | :{port} | {hostname:<33} | {ver:<10} | {banner}"
+                info = f"{ip:<15} | :{port} | {hostname:<33} | {res['fabricante']:<12} | {ver:<10} | {banner}"
 
                 if status == "VULNERÁVEL":
                     log("VULN", f"{info} → [{cves_str}]")
                     with _log_lock:
                         with open(LOG_VULN, "a", encoding="utf-8") as f:
                             f.write(f"{ip:<16} {port:<6} {hostname:<38} {ver:<12} {cves_str:<35} {status}\n")
-                        with open(LOG_CERT, "a", encoding="utf-8") as f:
-                            f.write(format_cert_line(res) + "\n")
+                        with open(LOG_CERT, "a", newline="", encoding="utf-8") as f:
+                            csv.DictWriter(f, fieldnames=["IP", "PORTA", "TIMESTAMP_UTC", "DOMINIO", "FABRICANTE", "SW_NAME", "SW_VERSAO", "CVEs", "BANNER"]).writerow(format_cert_row(res))
                     count_vuln += 1
 
                 elif status in ("VERSÃO-OCULTA", "SSH-NÃO-OPENSSH"):
@@ -601,6 +642,9 @@ def main():
                             "IP":             ip,
                             "PORTA":          port,
                             "HOSTNAME":       hostname,
+                            "FABRICANTE":     res["fabricante"],
+                            "SW_NAME":        res["sw_name"],
+                            "SW_VERSAO":      res["sw_ver"],
                             "BANNER":         banner,
                             "VERSAO_OPENSSH": ver,
                             "CVEs":           cves_str,
@@ -625,20 +669,22 @@ def main():
 
     # Mostra prévia da saída estruturada no terminal
     if count_vuln > 0:
-        print(f"\n  {BOLD}{MAGENTA}══ Prévia — Saída Estruturada ══{RESET}")
-        print(f"  {GREY}{'─' * 90}{RESET}")
-        print(f"  {'IP':<16} | {'Porta':<5} | {'Timestamp (UTC)':<20} | {'Dominio':<35} | Detalhes")
-        print(f"  {GREY}{'─' * 90}{RESET}")
+        print(f"\n  {BOLD}{MAGENTA}══ Prévia — Saída Estruturada (top 20) ══{RESET}")
+        print(f"  {GREY}{'─' * 110}{RESET}")
+        print(f"  {'IP':<16} | {'Porta':<5} | {'Timestamp (UTC)':<20} | {'Dominio':<35} | {'Fabricante':<12} | {'SW':<12} | {'Versão':<10} | CVEs")
+        print(f"  {GREY}{'─' * 110}{RESET}")
         try:
+            import csv as _csv
             with open(LOG_CERT, "r", encoding="utf-8") as f:
-                lines = [l for l in f if not l.startswith("#") and l.strip() and "─" not in l]
-                for line in lines[:20]:
-                    print(f"  {line}", end="")
-            if len(lines) > 20:
-                print(f"\n  {GREY}... e mais {len(lines)-20} linha(s). Veja o arquivo completo: {LOG_CERT}{RESET}")
+                reader = _csv.DictReader(f)
+                rows = list(reader)
+                for row in rows[:20]:
+                    print(f"  {row['IP']:<16} | {row['PORTA']:<5} | {row['TIMESTAMP_UTC']:<20} | {row['DOMINIO']:<35} | {row['FABRICANTE']:<12} | {row['SW_NAME']:<12} | {row['SW_VERSAO']:<10} | {row['CVEs']}")
+            if len(rows) > 20:
+                print(f"\n  {GREY}... e mais {len(rows)-20} linha(s). Veja o arquivo completo: {LOG_CERT}{RESET}")
         except Exception:
             pass
-        print(f"  {GREY}{'─' * 90}{RESET}\n")
+        print(f"  {GREY}{'─' * 110}{RESET}\n")
 
 
 if __name__ == "__main__":
