@@ -1,0 +1,647 @@
+#!/usr/bin/env python3
+"""
+ssh_scanner.py — Scanner Proativo de Servidores SSH com OpenSSH Possivelmente Vulnerável
+------------------------------------------------------------------------------------------
+Varre alvos (IPs, CIDRs, ASNs) em busca de instâncias OpenSSH expostas e classifica
+sua versão em relação às CVEs conhecidas, de forma similar ao relatório do CERT.br:
+
+  CVE-2024-6387  (regreSSHion) — OpenSSH < 9.8p1
+  CVE-2023-48795 (Terrapin)    — OpenSSH < 9.6
+
+Saída no mesmo formato do aviso CERT.br:
+  IP | Porta | Timestamp (UTC) | Dominio | Detalhes
+
+Aceita IPs individuais, faixas CIDR e ASNs como entrada.
+
+Exemplos de uso:
+  python ssh_scanner.py --ip 177.39.22.175
+  python ssh_scanner.py --cidr 177.39.0.0/16
+  python ssh_scanner.py --asn AS12345
+  python ssh_scanner.py --file alvos.txt
+
+Dependências:
+  pip install packaging dnspython
+"""
+
+import re
+import os
+import sys
+import csv
+import time
+import json
+import socket
+import argparse
+import ipaddress
+import requests
+import threading
+from datetime import datetime, timezone
+from functools import lru_cache
+from packaging import version
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    import dns.resolver
+    import dns.reversename
+    import dns.exception
+    HAS_DNSPYTHON = True
+except ImportError:
+    HAS_DNSPYTHON = False
+
+# --- ANSI Colors -------------------------------------------------------------
+RED     = '\033[0;31m'
+GREEN   = '\033[0;32m'
+YELLOW  = '\033[1;33m'
+CYAN    = '\033[0;36m'
+BOLD    = '\033[1m'
+RESET   = '\033[0m'
+BLUE    = '\033[0;34m'
+MAGENTA = '\033[0;35m'
+GREY    = '\033[90m'
+
+# --- Configuração CVEs -------------------------------------------------------
+# CVE-2024-6387 (regreSSHion): afeta OpenSSH < 9.8p1
+# CVE-2023-48795 (Terrapin):   afeta OpenSSH < 9.6
+CVES = {
+    "CVE-2024-6387": {
+        "name": "regreSSHion",
+        "fixed": "9.8p1",
+        "desc": "RCE não autenticado via race condition no handler de sinal",
+        "severity": "CRITICAL",
+    },
+    "CVE-2023-48795": {
+        "name": "Terrapin",
+        "fixed": "9.6",
+        "desc": "Prefix truncation attack no protocolo SSH (BEP)",
+        "severity": "HIGH",
+    },
+}
+
+# Porta SSH padrão e alternativas comuns
+SSH_PORTS    = [22]
+SSH_TIMEOUT  = 3.0
+DNS_WORKERS  = 200
+DNS_TIMEOUT  = 1.5
+
+# --- Caminhos de saída -------------------------------------------------------
+LOG_DIR   = "./logs"
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+LOG_FILE  = f"{LOG_DIR}/ssh_scan_{TIMESTAMP}.log"
+LOG_VULN  = f"{LOG_DIR}/ssh_scan_{TIMESTAMP}_vulneraveis.txt"
+LOG_CSV   = f"{LOG_DIR}/ssh_scan_{TIMESTAMP}_resultados.csv"
+LOG_CERT  = f"{LOG_DIR}/ssh_scan_{TIMESTAMP}_formato_cert.txt"
+
+_log_lock = threading.Lock()
+
+# =============================================================================
+# Log
+# =============================================================================
+def log(level: str, msg: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    colors = {
+        "VULN":  f"{RED}[VULN]{RESET}",
+        "WARN":  f"{YELLOW}[AVISO]{RESET}",
+        "OK":    f"{GREEN}[SEGURO]{RESET}",
+        "INFO":  f"{CYAN}[INFO]{RESET}",
+        "ERR":   f"{RED}[ERRO]{RESET}",
+        "HEAD":  "",
+        "CERT":  f"{MAGENTA}[CERT]{RESET}",
+    }
+    if level == "HEAD":
+        line = f"{BOLD}{CYAN}{msg}{RESET}"
+    else:
+        line = f"{ts} {colors.get(level, '')} {msg}"
+
+    print(line)
+    clean = re.sub(r'\033\[[0-9;]*m', '', line)
+    with _log_lock:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(clean + "\n")
+
+
+# =============================================================================
+# DNS — resolução reversa em batch paralelo
+# =============================================================================
+def _resolve_ptr_dnspython(ip: str) -> str:
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.lifetime = DNS_TIMEOUT
+        rev = dns.reversename.from_address(ip)
+        answer = resolver.resolve(rev, "PTR")
+        return str(answer[0]).rstrip(".")
+    except Exception:
+        return "SEM-PTR"
+
+def _resolve_ptr_socket(ip: str) -> str:
+    try:
+        hostname, _, _ = socket.gethostbyaddr(ip)
+        return hostname
+    except Exception:
+        return "SEM-PTR"
+
+@lru_cache(maxsize=65536)
+def get_hostname(ip: str) -> str:
+    if HAS_DNSPYTHON:
+        return _resolve_ptr_dnspython(ip)
+    return _resolve_ptr_socket(ip)
+
+def resolve_hostnames_batch(ips: list) -> dict:
+    results = {}
+    with ThreadPoolExecutor(max_workers=DNS_WORKERS) as executor:
+        futures = {executor.submit(get_hostname, ip): ip for ip in ips}
+        for future in as_completed(futures):
+            ip = futures[future]
+            results[ip] = future.result()
+    return results
+
+
+# =============================================================================
+# Resolução de alvos (ASN / CIDR / IP)
+# =============================================================================
+def resolve_asn_ripe(asn_number: str) -> list:
+    url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn_number}"
+    try:
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "ssh-scanner/1.0"})
+        resp.raise_for_status()
+        data = resp.json()
+        prefixes = [
+            p["prefix"] for p in data.get("data", {}).get("prefixes", [])
+            if ":" not in p.get("prefix", ":")
+        ]
+        log("INFO", f"AS{asn_number} — {len(prefixes)} prefixo(s) originado(s) encontrado(s) via RIPE")
+        return prefixes
+    except Exception as e:
+        log("ERR", f"RIPE Stat falhou para AS{asn_number}: {e}")
+        return []
+
+def resolve_asn(asn: str) -> list:
+    asn_number = asn.upper().lstrip("AS")
+    log("INFO", f"Resolvendo {asn.upper()} via RIPE Stat ...")
+    prefixes = resolve_asn_ripe(asn_number)
+    if prefixes:
+        return prefixes
+
+    log("WARN", f"RIPE Stat não retornou prefixos para {asn.upper()}. Tentando bgp.tools ...")
+    url = f"https://bgp.tools/table.jsonl?asn={asn_number}"
+    try:
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "ssh-scanner/1.0"})
+        resp.raise_for_status()
+        prefixes = []
+        for line in resp.text.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                prefix = entry.get("CIDR") or entry.get("prefix") or entry.get("cidr")
+                origin = str(entry.get("ASN") or entry.get("origin_asn") or entry.get("origin") or "")
+                if prefix and ":" not in prefix and origin == asn_number:
+                    prefixes.append(prefix)
+            except Exception:
+                try:
+                    ipaddress.ip_network(line, strict=False)
+                    if ":" not in line:
+                        prefixes.append(line)
+                except ValueError:
+                    pass
+        log("INFO", f"{asn.upper()} — {len(prefixes)} prefixo(s) IPv4 encontrado(s) via bgp.tools")
+        return prefixes
+    except Exception as e:
+        log("ERR", f"bgp.tools também falhou para {asn.upper()}: {e}")
+        return []
+
+def expand_targets(ips=None, cidrs=None, asns=None, file=None) -> list:
+    all_prefixes = []
+
+    if ips:
+        for ip in ips:
+            try:
+                ipaddress.ip_address(ip)
+                all_prefixes.append(f"{ip}/32")
+            except ValueError:
+                if "/" in ip:
+                    log("WARN", f"'{ip}' parece um CIDR — use --cidr em vez de --ip")
+                else:
+                    log("WARN", f"Endereço IP inválido ignorado: '{ip}'")
+
+    if cidrs:
+        for cidr in cidrs:
+            try:
+                ipaddress.ip_network(cidr, strict=False)
+                all_prefixes.append(cidr)
+            except ValueError:
+                log("WARN", f"CIDR inválido ignorado: '{cidr}'")
+
+    if asns:
+        for asn in asns:
+            all_prefixes.extend(resolve_asn(asn))
+
+    if file:
+        try:
+            with open(file, encoding="utf-8") as fh:
+                for raw in fh:
+                    entry = raw.strip()
+                    if not entry or entry.startswith("#"):
+                        continue
+                    upper = entry.upper()
+                    if upper.startswith("AS") or upper.isdigit():
+                        all_prefixes.extend(resolve_asn(entry))
+                    elif "/" in entry:
+                        try:
+                            ipaddress.ip_network(entry, strict=False)
+                            all_prefixes.append(entry)
+                        except ValueError:
+                            log("WARN", f"CIDR inválido no arquivo ignorado: {entry}")
+                    else:
+                        try:
+                            ipaddress.ip_address(entry)
+                            all_prefixes.append(f"{entry}/32")
+                        except ValueError:
+                            log("WARN", f"Entrada inválida no arquivo ignorada: {entry}")
+        except FileNotFoundError:
+            log("ERR", f"Arquivo não encontrado: {file}")
+            sys.exit(1)
+
+    seen = set()
+    unique = []
+    for p in all_prefixes:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
+
+
+# =============================================================================
+# Banner SSH — leitura do banner de identificação
+# =============================================================================
+def grab_ssh_banner(ip: str, port: int = 22, timeout: float = SSH_TIMEOUT) -> str | None:
+    """
+    Conecta na porta SSH e lê o banner de identificação (ex: SSH-2.0-OpenSSH_9.7).
+    Retorna a string do banner ou None se falhar / não for SSH.
+    """
+    try:
+        sock = socket.create_connection((ip, port), timeout=timeout)
+        sock.settimeout(timeout)
+        banner = sock.recv(256).decode("utf-8", errors="ignore").strip()
+        sock.close()
+        if banner.startswith("SSH-"):
+            return banner
+        return None
+    except Exception:
+        return None
+
+
+# =============================================================================
+# Análise de versão e CVEs
+# =============================================================================
+def parse_openssh_version(banner: str) -> str | None:
+    """
+    Extrai a versão OpenSSH do banner.
+    Ex: 'SSH-2.0-OpenSSH_9.7' → '9.7'
+        'SSH-2.0-OpenSSH_9.3 FreeBSD-20230719' → '9.3'
+    """
+    match = re.search(r"OpenSSH[_\s]([\d.p]+)", banner, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return None
+
+def _normalize_ver(ver_str: str) -> str:
+    """Normaliza versão OpenSSH para comparação (ex: 9.8p1 → 9.8.1, 9.6 → 9.6.0)."""
+    ver_str = ver_str.strip()
+    # Trata 'p' como separador de patch (9.8p1 → 9.8.1)
+    ver_str = re.sub(r'p(\d+)', r'.\1', ver_str)
+    return ver_str
+
+def check_cves(openssh_version: str) -> list:
+    """
+    Verifica quais CVEs afetam a versão OpenSSH informada.
+    Retorna lista de CVE IDs afetados.
+    """
+    affected = []
+    try:
+        current = version.parse(_normalize_ver(openssh_version))
+    except Exception:
+        return []
+
+    for cve_id, info in CVES.items():
+        try:
+            fixed = version.parse(_normalize_ver(info["fixed"]))
+            if current < fixed:
+                affected.append(cve_id)
+        except Exception:
+            pass
+    return affected
+
+def classify_host(banner: str, openssh_ver: str | None, affected_cves: list) -> str:
+    """Retorna status textual do host."""
+    if not banner.startswith("SSH-"):
+        return "NÃO-SSH"
+    if "openssh" not in banner.lower():
+        return "SSH-NÃO-OPENSSH"
+    if openssh_ver is None:
+        return "VERSÃO-OCULTA"
+    if affected_cves:
+        return "VULNERÁVEL"
+    return "SEGURO"
+
+
+# =============================================================================
+# Scanner SSH principal
+# =============================================================================
+def scan_ip_ssh(ip: str, hostname: str, ports: list, timeout: float) -> dict | None:
+    """
+    Sonda um IP nas portas SSH informadas.
+    Retorna dict com resultado ou None se SSH não encontrado.
+    """
+    for port in ports:
+        banner = grab_ssh_banner(ip, port, timeout)
+        if banner is None:
+            continue
+
+        openssh_ver = parse_openssh_version(banner)
+        affected_cves = check_cves(openssh_ver) if openssh_ver else []
+        status = classify_host(banner, openssh_ver, affected_cves)
+
+        return {
+            "ip":            ip,
+            "port":          port,
+            "hostname":      hostname,
+            "banner":        banner,
+            "openssh_ver":   openssh_ver or "N/D",
+            "affected_cves": affected_cves,
+            "status":        status,
+            "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    return None
+
+
+# =============================================================================
+# Formatação no estilo CERT.br
+# =============================================================================
+def format_cert_line(res: dict) -> str:
+    """
+    Gera linha no formato idêntico ao aviso do CERT.br:
+    IP | Porta | Timestamp (UTC) | Dominio | Detalhes
+    """
+    cves_str  = ";".join(res["affected_cves"]).lower()
+    detalhes  = f"{cves_str};ssh;{res['banner']}" if cves_str else f"ssh;{res['banner']}"
+    return (
+        f"{res['ip']:<16} | "
+        f"{res['port']:<5} | "
+        f"{res['timestamp_utc']:<20} | "
+        f"{res['hostname']:<35} | "
+        f"{detalhes}"
+    )
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="SSH OpenSSH — Scanner Proativo de Vulnerabilidades (CVE-2024-6387 / CVE-2023-48795)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exemplos:
+  %(prog)s --ip 177.39.22.175
+  %(prog)s --cidr 177.39.0.0/16
+  %(prog)s --asn AS12345
+  %(prog)s --asn AS12345 AS67890 --cidr 10.0.0.0/8
+  %(prog)s --file alvos.txt
+  %(prog)s --cidr 10.0.0.0/24 --workers 100 --timeout 4 --ports 22 2222
+        """,
+    )
+    parser.add_argument("--ip",         nargs="+", metavar="IP",      help="Um ou mais IPs individuais")
+    parser.add_argument("--cidr",       nargs="+", metavar="CIDR",    help="Uma ou mais faixas CIDR")
+    parser.add_argument("--asn",        nargs="+", metavar="ASN",     help="Um ou mais ASNs (ex: AS12345)")
+    parser.add_argument("--file",       metavar="ARQUIVO",            help="Arquivo com IPs, CIDRs e/ou ASNs (um por linha)")
+    parser.add_argument("--ports",      nargs="+", type=int, default=SSH_PORTS, metavar="PORTA",
+                                                                       help=f"Portas SSH a varrer (padrão: {SSH_PORTS})")
+    parser.add_argument("--workers",    type=int,   default=60,        help="Threads para scan SSH (padrão: 60)")
+    parser.add_argument("--dns-workers",type=int,   default=DNS_WORKERS, help=f"Threads para resolução DNS (padrão: {DNS_WORKERS})")
+    parser.add_argument("--timeout",    type=float, default=SSH_TIMEOUT, help=f"Timeout da conexão SSH em segundos (padrão: {SSH_TIMEOUT})")
+    parser.add_argument("--dns-timeout",type=float, default=DNS_TIMEOUT, help=f"Timeout das queries DNS em segundos (padrão: {DNS_TIMEOUT})")
+    parser.add_argument("--no-confirm", action="store_true",           help="Pula confirmação antes de iniciar")
+    return parser.parse_args()
+
+def normalize_argv():
+    normalized = []
+    for arg in sys.argv[1:]:
+        if arg.startswith("--") and not arg.startswith("--no"):
+            normalized.append(arg.lower())
+        else:
+            normalized.append(arg)
+    sys.argv[1:] = normalized
+
+
+# =============================================================================
+# Main
+# =============================================================================
+def main():
+    normalize_argv()
+    args = parse_args()
+
+    if not any([args.ip, args.cidr, args.asn, args.file]):
+        print(f"\n{RED}[ERR]{RESET} Nenhum alvo especificado.")
+        print(f"\n Use um ou mais dos argumentos abaixo:")
+        print(f"  {CYAN}--ip{RESET}   <IP>       IP individual      ex: --ip 177.39.22.175")
+        print(f"  {CYAN}--cidr{RESET} <CIDR>     Faixa de rede      ex: --cidr 177.39.0.0/16")
+        print(f"  {CYAN}--asn{RESET}  <ASN>      Sistema autônomo   ex: --asn AS12345")
+        print(f"  {CYAN}--file{RESET} <arquivo>  Arquivo de alvos   ex: --file alvos.txt")
+        print(f"\n Execute com {BOLD}--help{RESET} para ver todos os parâmetros.\n")
+        sys.exit(1)
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    # Banner
+    print(f"""{CYAN}
+  ███████╗███████╗██╗  ██╗    ███████╗ ██████╗ █████╗ ███╗   ██╗███╗   ██╗███████╗██████╗
+  ██╔════╝██╔════╝██║  ██║    ██╔════╝██╔════╝██╔══██╗████╗  ██║████╗  ██║██╔════╝██╔══██╗
+  ███████╗███████╗███████║    ███████╗██║     ███████║██╔██╗ ██║██╔██╗ ██║█████╗  ██████╔╝
+  ╚════██║╚════██║██╔══██║    ╚════██║██║     ██╔══██║██║╚██╗██║██║╚██╗██║██╔══╝  ██╔══██╗
+  ███████║███████║██║  ██║    ███████║╚██████╗██║  ██║██║ ╚████║██║ ╚████║███████╗██║  ██║
+  ╚══════╝╚══════╝╚═╝  ╚═╝    ╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝{RESET}""")
+
+    print(f"  {GREY}{'─' * 90}{RESET}")
+    print(f"  {YELLOW}CVE-2024-6387{RESET} {GREY}│{RESET} regreSSHion   {GREY}│{RESET} OpenSSH < 9.8p1 — RCE não autenticado")
+    print(f"  {YELLOW}CVE-2023-48795{RESET} {GREY}│{RESET} Terrapin      {GREY}│{RESET} OpenSSH < 9.6   — Prefix truncation attack")
+    print(f"  {GREY}{'─' * 90}{RESET}\n")
+
+    if not HAS_DNSPYTHON:
+        print(f"  {YELLOW}[AVISO]{RESET} dnspython não instalado — usando socket padrão para DNS (mais lento).")
+        print(f"  Instale com: {CYAN}pip install dnspython{RESET}\n")
+
+    # Resolve alvos
+    prefixes = expand_targets(
+        ips=args.ip,
+        cidrs=args.cidr,
+        asns=args.asn,
+        file=args.file,
+    )
+
+    if not prefixes:
+        print(f"\n{RED}[ERR]{RESET} Nenhum alvo válido encontrado após resolução.\n")
+        sys.exit(1)
+
+    total_hosts = sum(
+        ipaddress.ip_network(p, strict=False).num_addresses - (2 if ipaddress.ip_network(p, strict=False).prefixlen < 31 else 0)
+        for p in prefixes
+    )
+
+    print(f"  {BOLD}Alvos resolvidos:{RESET} {len(prefixes)} prefixo(s) / ~{total_hosts:,} host(s)")
+    print(f"  {BOLD}Portas SSH:{RESET}       {args.ports}\n")
+    for p in prefixes:
+        net = ipaddress.ip_network(p, strict=False)
+        print(f"  {CYAN}•{RESET} {p:<20} ({net.num_addresses} addr)")
+    print()
+
+    if not args.no_confirm:
+        confirm = input(f"  {BOLD}Iniciar varredura? [s/N]:{RESET} ").strip().lower()
+        if confirm != "s":
+            print("  Cancelado.")
+            sys.exit(0)
+
+    # Inicializa arquivos de saída
+    cert_header = (
+        f"# SSH Scanner — Formato CERT.br | {TIMESTAMP}\n"
+        f"# CVEs: CVE-2024-6387 (regreSSHion) | CVE-2023-48795 (Terrapin)\n"
+        f"#\n"
+        f"{'IP':<16} | {'Porta':<5} | {'Timestamp (UTC)':<20} | {'Dominio':<35} | Detalhes\n"
+        f"{'─'*16}-+-{'─'*5}-+-{'─'*20}-+-{'─'*35}-+-{'─'*50}\n"
+    )
+    with open(LOG_CERT, "w", encoding="utf-8") as f:
+        f.write(cert_header)
+
+    with open(LOG_VULN, "w", encoding="utf-8") as f:
+        f.write(f"# SSH VULNERÁVEL | {TIMESTAMP}\n")
+        f.write(f"{'IP':<16} {'PORTA':<6} {'HOSTNAME':<38} {'VERSÃO':<12} {'CVEs':<35} STATUS\n")
+        f.write(f"{'='*16} {'='*6} {'='*38} {'='*12} {'='*35} {'='*20}\n")
+
+    fieldnames = ["IP", "PORTA", "HOSTNAME", "BANNER", "VERSAO_OPENSSH", "CVEs", "STATUS", "TIMESTAMP_UTC"]
+    with open(LOG_CSV, "w", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+
+    log("HEAD", "══════════════════════════════════════════════════════════════════")
+    log("INFO", f"Início: {datetime.now()}")
+    log("INFO", f"Prefixos: {len(prefixes)}")
+    log("INFO", f"Portas SSH: {args.ports}")
+    log("INFO", f"Workers SSH: {args.workers}")
+    log("INFO", f"Workers DNS: {args.dns_workers}")
+    log("INFO", f"Timeout SSH: {args.timeout}s")
+    log("INFO", f"Timeout DNS: {args.dns_timeout}s")
+    log("INFO", f"Log: {LOG_FILE}")
+    log("INFO", f"CSV: {LOG_CSV}")
+    log("INFO", f"Formato CERT: {LOG_CERT}")
+    log("INFO", f"Backend DNS: {'dnspython' if HAS_DNSPYTHON else 'socket (fallback)'}")
+    log("HEAD", "══════════════════════════════════════════════════════════════════")
+
+    count_vuln  = 0
+    count_warn  = 0
+    count_safe  = 0
+    count_ssh   = 0
+    start_time  = time.time()
+
+    for prefix in prefixes:
+        try:
+            network = ipaddress.ip_network(prefix, strict=False)
+        except ValueError:
+            log("WARN", f"Prefixo inválido ignorado: {prefix}")
+            continue
+
+        ips = [str(ip) for ip in network.hosts()] or [str(network.network_address)]
+
+        log("HEAD", f"[ {prefix} ] — resolvendo DNS de {len(ips)} host(s) ...")
+        dns_map = resolve_hostnames_batch(ips)
+
+        log("HEAD", f"[ {prefix} ] — escaneando {len(ips)} host(s) na(s) porta(s) {args.ports} ...")
+
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {
+                executor.submit(scan_ip_ssh, ip, dns_map.get(ip, "SEM-PTR"), args.ports, args.timeout): ip
+                for ip in ips
+            }
+            for future in as_completed(futures):
+                res = future.result()
+                if res is None:
+                    continue
+
+                count_ssh += 1
+                ip       = res["ip"]
+                port     = res["port"]
+                hostname = res["hostname"]
+                ver      = res["openssh_ver"]
+                cves     = res["affected_cves"]
+                status   = res["status"]
+                banner   = res["banner"]
+                cves_str = ";".join(cves) if cves else "—"
+
+                info = f"{ip:<15} | :{port} | {hostname:<33} | {ver:<10} | {banner}"
+
+                if status == "VULNERÁVEL":
+                    log("VULN", f"{info} → [{cves_str}]")
+                    with _log_lock:
+                        with open(LOG_VULN, "a", encoding="utf-8") as f:
+                            f.write(f"{ip:<16} {port:<6} {hostname:<38} {ver:<12} {cves_str:<35} {status}\n")
+                        with open(LOG_CERT, "a", encoding="utf-8") as f:
+                            f.write(format_cert_line(res) + "\n")
+                    count_vuln += 1
+
+                elif status in ("VERSÃO-OCULTA", "SSH-NÃO-OPENSSH"):
+                    log("WARN", f"{info} → {status}")
+                    count_warn += 1
+
+                else:
+                    log("OK", f"{info} → {status}")
+                    count_safe += 1
+
+                with _log_lock:
+                    with open(LOG_CSV, "a", newline="", encoding="utf-8") as f:
+                        csv.DictWriter(f, fieldnames=fieldnames).writerow({
+                            "IP":             ip,
+                            "PORTA":          port,
+                            "HOSTNAME":       hostname,
+                            "BANNER":         banner,
+                            "VERSAO_OPENSSH": ver,
+                            "CVEs":           cves_str,
+                            "STATUS":         status,
+                            "TIMESTAMP_UTC":  res["timestamp_utc"],
+                        })
+
+    elapsed = int(time.time() - start_time)
+
+    log("HEAD", "══════════════════════════════════════════════════════════════════")
+    log("INFO", f"Fim: {datetime.now()}")
+    log("INFO", f"Tempo total: {elapsed}s")
+    log("INFO", f"Hosts SSH encontrados: {count_ssh}")
+    log("INFO", f"Vulneráveis: {count_vuln}")
+    log("INFO", f"Avisos: {count_warn}")
+    log("INFO", f"Seguros: {count_safe}")
+    log("INFO", f"Log completo: {LOG_FILE}")
+    log("INFO", f"Lista vulneráv.: {LOG_VULN}")
+    log("INFO", f"Resultados CSV: {LOG_CSV}")
+    log("INFO", f"Formato CERT.br: {LOG_CERT}")
+    log("HEAD", "══════════════════════════════════════════════════════════════════")
+
+    # Mostra prévia do arquivo formato CERT.br no terminal
+    if count_vuln > 0:
+        print(f"\n  {BOLD}{MAGENTA}══ Prévia — Formato CERT.br ══{RESET}")
+        print(f"  {GREY}{'─' * 90}{RESET}")
+        print(f"  {'IP':<16} | {'Porta':<5} | {'Timestamp (UTC)':<20} | {'Dominio':<35} | Detalhes")
+        print(f"  {GREY}{'─' * 90}{RESET}")
+        try:
+            with open(LOG_CERT, "r", encoding="utf-8") as f:
+                lines = [l for l in f if not l.startswith("#") and l.strip() and "─" not in l]
+                for line in lines[:20]:
+                    print(f"  {line}", end="")
+            if len(lines) > 20:
+                print(f"\n  {GREY}... e mais {len(lines)-20} linha(s). Veja o arquivo completo: {LOG_CERT}{RESET}")
+        except Exception:
+            pass
+        print(f"  {GREY}{'─' * 90}{RESET}\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n  Interrompido.")
+        sys.exit(0)
