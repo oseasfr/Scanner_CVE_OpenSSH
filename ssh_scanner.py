@@ -3,12 +3,12 @@
 ssh_scanner.py — Scanner Proativo de Servidores SSH com OpenSSH Possivelmente Vulnerável
 ------------------------------------------------------------------------------------------
 Varre alvos (IPs, CIDRs, ASNs) em busca de instâncias OpenSSH expostas e classifica
-sua versão em relação às CVEs conhecidas, de forma similar ao relatório do CERT.br:
+sua versão em relação às CVEs conhecidas, identificando versões vulneráveis conhecidas:
 
   CVE-2024-6387  (regreSSHion) — OpenSSH < 9.8p1
   CVE-2023-48795 (Terrapin)    — OpenSSH < 9.6
 
-Saída no mesmo formato do aviso CERT.br:
+Saída estruturada com IP, porta, timestamp, domínio e detalhes:
   IP | Porta | Timestamp (UTC) | Dominio | Detalhes
 
 Aceita IPs individuais, faixas CIDR e ASNs como entrada.
@@ -33,6 +33,8 @@ import socket
 import argparse
 import ipaddress
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import threading
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -88,7 +90,7 @@ TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 LOG_FILE  = f"{LOG_DIR}/ssh_scan_{TIMESTAMP}.log"
 LOG_VULN  = f"{LOG_DIR}/ssh_scan_{TIMESTAMP}_vulneraveis.txt"
 LOG_CSV   = f"{LOG_DIR}/ssh_scan_{TIMESTAMP}_resultados.csv"
-LOG_CERT  = f"{LOG_DIR}/ssh_scan_{TIMESTAMP}_formato_cert.txt"
+LOG_CERT  = f"{LOG_DIR}/ssh_scan_{TIMESTAMP}_formato_estruturado.txt"
 
 _log_lock = threading.Lock()
 
@@ -104,7 +106,7 @@ def log(level: str, msg: str):
         "INFO":  f"{CYAN}[INFO]{RESET}",
         "ERR":   f"{RED}[ERRO]{RESET}",
         "HEAD":  "",
-        "CERT":  f"{MAGENTA}[CERT]{RESET}",
+        "STRUCT": f"{MAGENTA}[STRUCT]{RESET}",
     }
     if level == "HEAD":
         line = f"{BOLD}{CYAN}{msg}{RESET}"
@@ -160,7 +162,7 @@ def resolve_hostnames_batch(ips: list) -> dict:
 def resolve_asn_ripe(asn_number: str) -> list:
     url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn_number}"
     try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "ssh-scanner/1.0"})
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "ssh-scanner/1.0"}, verify=False)
         resp.raise_for_status()
         data = resp.json()
         prefixes = [
@@ -183,7 +185,7 @@ def resolve_asn(asn: str) -> list:
     log("WARN", f"RIPE Stat não retornou prefixos para {asn.upper()}. Tentando bgp.tools ...")
     url = f"https://bgp.tools/table.jsonl?asn={asn_number}"
     try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "ssh-scanner/1.0"})
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "ssh-scanner/1.0"}, verify=False)
         resp.raise_for_status()
         prefixes = []
         for line in resp.text.strip().splitlines():
@@ -375,11 +377,11 @@ def scan_ip_ssh(ip: str, hostname: str, ports: list, timeout: float) -> dict | N
 
 
 # =============================================================================
-# Formatação no estilo CERT.br
+# Formatação estruturada de saída
 # =============================================================================
 def format_cert_line(res: dict) -> str:
     """
-    Gera linha no formato idêntico ao aviso do CERT.br:
+    Gera linha estruturada com IP, porta, timestamp, domínio e detalhes.
     IP | Porta | Timestamp (UTC) | Dominio | Detalhes
     """
     cves_str  = ";".join(res["affected_cves"]).lower()
@@ -502,7 +504,7 @@ def main():
 
     # Inicializa arquivos de saída
     cert_header = (
-        f"# SSH Scanner — Formato CERT.br | {TIMESTAMP}\n"
+        f"# SSH Scanner — Saída Estruturada | {TIMESTAMP}\n"
         f"# CVEs: CVE-2024-6387 (regreSSHion) | CVE-2023-48795 (Terrapin)\n"
         f"#\n"
         f"{'IP':<16} | {'Porta':<5} | {'Timestamp (UTC)':<20} | {'Dominio':<35} | Detalhes\n"
@@ -530,7 +532,7 @@ def main():
     log("INFO", f"Timeout DNS: {args.dns_timeout}s")
     log("INFO", f"Log: {LOG_FILE}")
     log("INFO", f"CSV: {LOG_CSV}")
-    log("INFO", f"Formato CERT: {LOG_CERT}")
+    log("INFO", f"Saída estruturada: {LOG_CERT}")
     log("INFO", f"Backend DNS: {'dnspython' if HAS_DNSPYTHON else 'socket (fallback)'}")
     log("HEAD", "══════════════════════════════════════════════════════════════════")
 
@@ -618,12 +620,12 @@ def main():
     log("INFO", f"Log completo: {LOG_FILE}")
     log("INFO", f"Lista vulneráv.: {LOG_VULN}")
     log("INFO", f"Resultados CSV: {LOG_CSV}")
-    log("INFO", f"Formato CERT.br: {LOG_CERT}")
+    log("INFO", f"Saída estruturada: {LOG_CERT}")
     log("HEAD", "══════════════════════════════════════════════════════════════════")
 
-    # Mostra prévia do arquivo formato CERT.br no terminal
+    # Mostra prévia da saída estruturada no terminal
     if count_vuln > 0:
-        print(f"\n  {BOLD}{MAGENTA}══ Prévia — Formato CERT.br ══{RESET}")
+        print(f"\n  {BOLD}{MAGENTA}══ Prévia — Saída Estruturada ══{RESET}")
         print(f"  {GREY}{'─' * 90}{RESET}")
         print(f"  {'IP':<16} | {'Porta':<5} | {'Timestamp (UTC)':<20} | {'Dominio':<35} | Detalhes")
         print(f"  {GREY}{'─' * 90}{RESET}")
