@@ -10,8 +10,8 @@ Saída estruturada com IP, porta, timestamp, domínio e detalhes:
 IP | Porta | Timestamp (UTC) | Dominio | Detalhes
 Aceita IPs individuais, faixas CIDR e ASNs como entrada.
 Exemplos de uso:
-python ssh_scanner.py --ip 177.39.22.175
-python ssh_scanner.py --cidr 177.39.0.0/16
+python ssh_scanner.py --ip 192.168.1.10
+python ssh_scanner.py --cidr 192.168.0.0/24
 python ssh_scanner.py --asn AS12345
 python ssh_scanner.py --file alvos.txt
 Dependências:
@@ -51,6 +51,7 @@ RESET = '\033[0m'
 BLUE = '\033[0;34m'
 MAGENTA = '\033[0;35m'
 GREY = '\033[90m'
+GREEN_DARK = '\033[0;32m'
 # --- Configuração CVEs -------------------------------------------------------
 # CVE-2024-6387 (regreSSHion): afeta OpenSSH < 9.8p1
 # CVE-2023-48795 (Terrapin): afeta OpenSSH < 9.6
@@ -376,6 +377,24 @@ def scan_ip_ssh(ip: str, hostname: str, ports: list, timeout: float) -> dict | N
             "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
     return None
+
+# =============================================================================
+# Descoberta de portas SSH em range completo (0-65535)
+# =============================================================================
+def scan_all_ports_for_ssh(ip: str, timeout: float) -> list:
+    """
+    Varre todas as portas (0-65535) do IP procurando serviços SSH.
+    Retorna lista de portas que responderam com banner SSH válido.
+    """
+    found = []
+    def probe(port):
+        banner = grab_ssh_banner(ip, port, timeout)
+        if banner:
+            found.append(port)
+    with ThreadPoolExecutor(max_workers=500) as ex:
+        list(as_completed([ex.submit(probe, p) for p in range(0, 65536)]))
+    return sorted(found)
+
 # =============================================================================
 # Formatação estruturada de saída
 # =============================================================================
@@ -402,12 +421,13 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplos:
-  %(prog)s --ip 177.39.22.175
-  %(prog)s --cidr 177.39.0.0/16
+  %(prog)s --ip 192.168.1.10
+  %(prog)s --cidr 192.168.0.0/24
   %(prog)s --asn AS12345
   %(prog)s --asn AS12345 AS67890 --cidr 10.0.0.0/8
   %(prog)s --file alvos.txt
-  %(prog)s --cidr 10.0.0.0/24 --workers 100 --timeout 4 --ports 22 2222
+  %(prog)s --cidr 192.168.0.0/24 --workers 100 --timeout 4 --ports 22 2222
+  %(prog)s --cidr 10.0.0.0/8 --port-scan
 """,
     )
     parser.add_argument("--ip",          nargs="+", metavar="IP",      help="Um ou mais IPs individuais")
@@ -423,6 +443,8 @@ Exemplos:
                         help=f"Timeout da conexão SSH em segundos (padrão: {SSH_TIMEOUT})")
     parser.add_argument("--dns-timeout", type=float, default=DNS_TIMEOUT,
                         help=f"Timeout das queries DNS em segundos (padrão: {DNS_TIMEOUT})")
+    parser.add_argument("--port-scan",   action="store_true",
+                        help="Descobre SSH varrendo todas as portas (0-65535) antes de analisar vulnerabilidades")
     parser.add_argument("--no-confirm",  action="store_true",           help="Pula confirmação antes de iniciar")
     return parser.parse_args()
 def normalize_argv():
@@ -440,10 +462,10 @@ def main():
     normalize_argv()
     args = parse_args()
     if not any([args.ip, args.cidr, args.asn, args.file]):
-        print(f"\n{RED}[ERR]{RESET} Nenhum alvo especificado.")
+        print(f"\n{YELLOW}[OPA]{RESET} Nenhum alvo especificado.")
         print(f"\n {BOLD}Alvos {GREY}(obrigatório — um ou mais):{RESET}")
-        print(f"  {CYAN}--ip{RESET}   <IP ...>      IP(s) individual(is)   ex: --ip 177.39.22.175")
-        print(f"  {CYAN}--cidr{RESET} <CIDR ...>    Faixa(s) de rede       ex: --cidr 177.39.0.0/16")
+        print(f"  {CYAN}--ip{RESET}   <IP ...>      IP(s) individual(is)   ex: --ip 192.168.1.10")
+        print(f"  {CYAN}--cidr{RESET} <CIDR ...>    Faixa(s) de rede       ex: --cidr 192.168.0.0/24")
         print(f"  {CYAN}--asn{RESET}  <ASN ...>     Sistema(s) autônomo(s) ex: --asn AS12345")
         print(f"  {CYAN}--file{RESET} <arquivo>     Arquivo de alvos       ex: --file alvos.txt")
         print(f"\n {BOLD}Opções adicionais:{RESET}")
@@ -452,22 +474,23 @@ def main():
         print(f"  {CYAN}--dns-workers{RESET} <N>          Threads resolução DNS  {GREY}(padrão: {DNS_WORKERS}){RESET}")
         print(f"  {CYAN}--timeout{RESET}     <seg>        Timeout conexão SSH    {GREY}(padrão: {SSH_TIMEOUT}s){RESET}")
         print(f"  {CYAN}--dns-timeout{RESET} <seg>        Timeout query DNS      {GREY}(padrão: {DNS_TIMEOUT}s){RESET}")
+        print(f"  {CYAN}--port-scan{RESET}                Descobre SSH varrendo todas as portas (0-65535)")
         print(f"  {CYAN}--no-confirm{RESET}               Pula confirmação antes de iniciar")
         print(f"\n  Execute com {BOLD}--help{RESET} para ver todos os parâmetros.\n")
         sys.exit(1)
     os.makedirs(LOG_DIR, exist_ok=True)
     # Banner
-    print(f"""{CYAN}
-███████╗███████╗██╗ ██╗ ███████╗ ██████╗ █████╗ ███╗ ██╗███╗ ██╗███████╗██████╗
-██╔════╝██╔════╝██║ ██║ ██╔════╝██╔════╝██╔══██╗████╗ ██║████╗ ██║██╔════╝██╔══██╗
-███████╗███████╗███████║ ███████╗██║ ███████║██╔██╗ ██║██╔██╗ ██║█████╗ ██████╔╝
-╚════██║╚════██║██╔══██║ ╚════██║██║ ██╔══██║██║╚██╗██║██║╚██╗██║██╔══╝ ██╔══██╗
-███████║███████║██║ ██║ ███████║╚██████╗██║ ██║██║ ╚████║██║ ╚████║███████╗██║ ██║
-╚══════╝╚══════╝╚═╝ ╚═╝ ╚══════╝ ╚═════╝╚═╝ ╚═╝╚═╝ ╚═══╝╚═╝ ╚═══╝╚══════╝╚═╝ ╚═╝{RESET}""")
-    print(f" {GREY}{'─' * 90}{RESET}")
-    print(f" {YELLOW}CVE-2024-6387{RESET} {GREY}│{RESET} regreSSHion {GREY}│{RESET} OpenSSH < 9.8p1 — RCE não autenticado")
-    print(f" {YELLOW}CVE-2023-48795{RESET} {GREY}│{RESET} Terrapin    {GREY}│{RESET} OpenSSH < 9.6   — Prefix truncation attack")
-    print(f" {GREY}{'─' * 90}{RESET}\n")
+    print(f"""{GREEN_DARK}
+ ███████╗███████╗██╗  ██╗    ███████╗ ██████╗ █████╗ ███╗  ██╗███╗  ██╗███████╗██████╗
+ ██╔════╝██╔════╝██║  ██║    ██╔════╝██╔════╝██╔══██╗████╗ ██║████╗ ██║██╔════╝██╔══██╗
+ ███████╗███████╗███████║    ███████╗██║     ███████║██╔██╗ ██║██╔██╗ ██║█████╗  ██████╔╝
+ ╚════██║╚════██║██╔══██║    ╚════██║██║     ██╔══██║██║╚██╗██║██║╚██╗██║██╔══╝  ██╔══██╗
+ ███████║███████║██║  ██║    ███████║╚██████╗██║  ██║██║ ╚████║██║ ╚████║███████╗██║  ██║
+ ╚══════╝╚══════╝╚═╝  ╚═╝    ╚══════╝╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝{RESET}""")
+    print(f" \033[90m{'─' * 77}\033[0m")
+    print(f"  {YELLOW}CVE-2024-6387{RESET}  \033[90m│\033[0m  {CYAN}regreSSHion{RESET}  \033[90m│\033[0m  OpenSSH < 9.8p1 — RCE não autenticado")
+    print(f"  {YELLOW}CVE-2023-48795{RESET}  \033[90m│\033[0m  {CYAN}Terrapin{RESET}  \033[90m│\033[0m  OpenSSH < 9.6 — Prefix truncation attack")
+    print(f" \033[90m{'─' * 77}\033[0m\n")
     if not HAS_DNSPYTHON:
         print(f" {YELLOW}[AVISO]{RESET} dnspython não instalado — usando socket padrão para DNS (mais lento).")
         print(f" Instale com: {CYAN}pip install dnspython{RESET}\n")
@@ -533,11 +556,27 @@ def main():
         ips = [str(ip) for ip in network.hosts()] or [str(network.network_address)]
         log("HEAD", f"[ {prefix} ] — resolvendo DNS de {len(ips)} host(s) ...")
         dns_map = resolve_hostnames_batch(ips)
-        log("HEAD", f"[ {prefix} ] — escaneando {len(ips)} host(s) na(s) porta(s) {args.ports} ...")
+        if args.port_scan:
+            log("HEAD", f"[ {prefix} ] — modo port-scan: varrendo portas 0-65535 em {len(ips)} host(s) ...")
+            def _get_ports(ip):
+                ports = scan_all_ports_for_ssh(ip, args.timeout)
+                if ports:
+                    log("INFO", f"{ip} — SSH encontrado nas portas: {ports}")
+                return ip, ports
+            port_map = {}
+            with ThreadPoolExecutor(max_workers=args.workers) as ex:
+                for fut in as_completed([ex.submit(_get_ports, ip) for ip in ips]):
+                    ip_r, ports_r = fut.result()
+                    if ports_r:
+                        port_map[ip_r] = ports_r
+            scan_targets = [(ip, port_map[ip]) for ip in ips if ip in port_map]
+        else:
+            scan_targets = [(ip, args.ports) for ip in ips]
+        log("HEAD", f"[ {prefix} ] — analisando vulnerabilidades em {len(scan_targets)} host(s) ...")
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = {
-                executor.submit(scan_ip_ssh, ip, dns_map.get(ip, "SEM-PTR"), args.ports, args.timeout): ip
-                for ip in ips
+                executor.submit(scan_ip_ssh, ip, dns_map.get(ip, "SEM-PTR"), ports, args.timeout): ip
+                for ip, ports in scan_targets
             }
             for future in as_completed(futures):
                 res = future.result()
