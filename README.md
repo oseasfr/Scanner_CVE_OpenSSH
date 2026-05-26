@@ -1,6 +1,6 @@
-# SSH Scanner — Detecção Proativa de OpenSSH Vulnerável
+<img width="810" height="220" alt="image" src="https://github.com/user-attachments/assets/4280eea6-7556-4f35-901c-3ca47d89e971" />
 
-Scanner proativo para identificação de servidores SSH com **OpenSSH** possivelmente vulnerável às CVEs mais críticas conhecidas. Além de OpenSSH, identifica automaticamente outros softwares SSH (Mikrotik, Cisco, Dropbear, etc.) e os classifica separadamente.
+Scanner para identificação de servidores com softwares SSH possivelmente vulnerável às CVEs mais críticas conhecidas.
 
 ---
 
