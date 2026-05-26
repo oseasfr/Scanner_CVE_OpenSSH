@@ -283,18 +283,15 @@ def detect_ssh_software(banner: str) -> tuple:
     'SSH-2.0-dropbear_2022.83' → ('Dropbear', 'dropbear', '2022.83')
     'SSH-2.0-OpenSSH_9.3 FreeBSD-...' → ('OpenSSH', 'OpenSSH', '9.3')
     """
-    # Extrai a parte do software após SSH-2.0- (ou SSH-1.x-)
     match_sw = re.match(r"SSH-[\d.]+-(.+)", banner)
     raw = match_sw.group(1).strip() if match_sw else banner
-    # Tenta extrair nome_software e versão no formato Nome_versão ou Nome-versão
     match_ver = re.match(r"([A-Za-z][A-Za-z0-9\-\.]+)[_\-]([\d][\d\.p\-a-zA-Z]*)", raw)
     if match_ver:
         sw_name = match_ver.group(1)
         sw_ver = match_ver.group(2)
     else:
-        sw_name = raw.split()[0]  # pega só o primeiro token
+        sw_name = raw.split()[0]
         sw_ver = "N/D"
-    # Mapeamento de fabricante pelo nome do software
     fabricante_map = {
         "openssh": "OpenSSH",
         "rosssh": "Mikrotik",
@@ -315,7 +312,6 @@ def detect_ssh_software(banner: str) -> tuple:
 def _normalize_ver(ver_str: str) -> str:
     """Normaliza versão OpenSSH para comparação (ex: 9.8p1 → 9.8.1, 9.6 → 9.6.0)."""
     ver_str = ver_str.strip()
-    # Trata 'p' como separador de patch (9.8p1 → 9.8.1)
     ver_str = re.sub(r'p(\d+)', r'.\1', ver_str)
     return ver_str
 def check_cves(openssh_version: str) -> list:
@@ -377,24 +373,6 @@ def scan_ip_ssh(ip: str, hostname: str, ports: list, timeout: float) -> dict | N
             "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
     return None
-
-# =============================================================================
-# Descoberta de portas SSH em range completo (0-65535)
-# =============================================================================
-def scan_all_ports_for_ssh(ip: str, timeout: float) -> list:
-    """
-    Varre todas as portas (0-65535) do IP procurando serviços SSH.
-    Retorna lista de portas que responderam com banner SSH válido.
-    """
-    found = []
-    def probe(port):
-        banner = grab_ssh_banner(ip, port, timeout)
-        if banner:
-            found.append(port)
-    with ThreadPoolExecutor(max_workers=500) as ex:
-        list(as_completed([ex.submit(probe, p) for p in range(0, 65536)]))
-    return sorted(found)
-
 # =============================================================================
 # Formatação estruturada de saída
 # =============================================================================
@@ -427,7 +405,6 @@ Exemplos:
   %(prog)s --asn AS12345 AS67890 --cidr 10.0.0.0/8
   %(prog)s --file alvos.txt
   %(prog)s --cidr 192.168.0.0/24 --workers 100 --timeout 4 --ports 22 2222
-  %(prog)s --cidr 10.0.0.0/8 --port-scan
 """,
     )
     parser.add_argument("--ip",          nargs="+", metavar="IP",      help="Um ou mais IPs individuais")
@@ -443,8 +420,6 @@ Exemplos:
                         help=f"Timeout da conexão SSH em segundos (padrão: {SSH_TIMEOUT})")
     parser.add_argument("--dns-timeout", type=float, default=DNS_TIMEOUT,
                         help=f"Timeout das queries DNS em segundos (padrão: {DNS_TIMEOUT})")
-    parser.add_argument("--port-scan",   action="store_true",
-                        help="Descobre SSH varrendo todas as portas (0-65535) antes de analisar vulnerabilidades")
     parser.add_argument("--no-confirm",  action="store_true",           help="Pula confirmação antes de iniciar")
     return parser.parse_args()
 def normalize_argv():
@@ -474,7 +449,6 @@ def main():
         print(f"  {CYAN}--dns-workers{RESET} <N>          Threads resolução DNS  {GREY}(padrão: {DNS_WORKERS}){RESET}")
         print(f"  {CYAN}--timeout{RESET}     <seg>        Timeout conexão SSH    {GREY}(padrão: {SSH_TIMEOUT}s){RESET}")
         print(f"  {CYAN}--dns-timeout{RESET} <seg>        Timeout query DNS      {GREY}(padrão: {DNS_TIMEOUT}s){RESET}")
-        print(f"  {CYAN}--port-scan{RESET}                Descobre SSH varrendo todas as portas (0-65535)")
         print(f"  {CYAN}--no-confirm{RESET}               Pula confirmação antes de iniciar")
         print(f"\n  Execute com {BOLD}--help{RESET} para ver todos os parâmetros.\n")
         sys.exit(1)
@@ -556,22 +530,7 @@ def main():
         ips = [str(ip) for ip in network.hosts()] or [str(network.network_address)]
         log("HEAD", f"[ {prefix} ] — resolvendo DNS de {len(ips)} host(s) ...")
         dns_map = resolve_hostnames_batch(ips)
-        if args.port_scan:
-            log("HEAD", f"[ {prefix} ] — modo port-scan: varrendo portas 0-65535 em {len(ips)} host(s) ...")
-            def _get_ports(ip):
-                ports = scan_all_ports_for_ssh(ip, args.timeout)
-                if ports:
-                    log("INFO", f"{ip} — SSH encontrado nas portas: {ports}")
-                return ip, ports
-            port_map = {}
-            with ThreadPoolExecutor(max_workers=args.workers) as ex:
-                for fut in as_completed([ex.submit(_get_ports, ip) for ip in ips]):
-                    ip_r, ports_r = fut.result()
-                    if ports_r:
-                        port_map[ip_r] = ports_r
-            scan_targets = [(ip, port_map[ip]) for ip in ips if ip in port_map]
-        else:
-            scan_targets = [(ip, args.ports) for ip in ips]
+        scan_targets = [(ip, args.ports) for ip in ips]
         log("HEAD", f"[ {prefix} ] — analisando vulnerabilidades em {len(scan_targets)} host(s) ...")
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = {
