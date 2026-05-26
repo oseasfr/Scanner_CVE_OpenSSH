@@ -314,9 +314,55 @@ def _normalize_ver(ver_str: str) -> str:
     ver_str = ver_str.strip()
     ver_str = re.sub(r'p(\d+)', r'.\1', ver_str)
     return ver_str
-def check_cves(openssh_version: str) -> list:
+def is_ubuntu_patched(banner: str, cve_id: str) -> bool:
     """
-    Verifica quais CVEs afetam a versão OpenSSH informada.
+    Detecta backports Ubuntu/Debian pelo sufixo do banner.
+    Ex: 'SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.15'
+
+    Revisoes conhecidas para Ubuntu 22.04 (OpenSSH 8.9p1):
+      ubuntu0.6+  -> CVE-2023-48795 corrigida
+      ubuntu0.10+ -> CVE-2024-6387  corrigida
+
+    Revisoes conhecidas para Ubuntu 20.04 (OpenSSH 8.2p1):
+      ubuntu0.10+ -> CVE-2023-48795 corrigida
+      ubuntu0.12+ -> CVE-2024-6387  corrigida
+    """
+    openssh_ver = parse_openssh_version(banner)
+    if not openssh_ver:
+        return False
+
+    # Ubuntu 22.04 e 20.04
+    match = re.search(r'Ubuntu-\d+ubuntu0\.(\d+)', banner, re.IGNORECASE)
+    if match:
+        patch_rev = int(match.group(1))
+        if openssh_ver.startswith("8.9"):
+            if cve_id == "CVE-2024-6387" and patch_rev >= 10:
+                return True
+            if cve_id == "CVE-2023-48795" and patch_rev >= 6:
+                return True
+        if openssh_ver.startswith("8.2"):
+            if cve_id == "CVE-2024-6387" and patch_rev >= 12:
+                return True
+            if cve_id == "CVE-2023-48795" and patch_rev >= 10:
+                return True
+
+    # Debian 12 Bookworm (ex: SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3)
+    # CVE-2023-48795: fixed in deb12u2 | CVE-2024-6387: fixed in deb12u3
+    match_deb = re.search(r'Debian-\d+\+deb12u(\d+)', banner, re.IGNORECASE)
+    if match_deb:
+        deb_rev = int(match_deb.group(1))
+        if openssh_ver.startswith("9.2"):
+            if cve_id == "CVE-2024-6387" and deb_rev >= 3:
+                return True
+            if cve_id == "CVE-2023-48795" and deb_rev >= 2:
+                return True
+
+    return False
+
+def check_cves(openssh_version: str, banner: str = "") -> list:
+    """
+    Verifica quais CVEs afetam a versao OpenSSH informada.
+    Considera backports Ubuntu/Debian pelo sufixo do banner.
     Retorna lista de CVE IDs afetados.
     """
     affected = []
@@ -328,7 +374,8 @@ def check_cves(openssh_version: str) -> list:
         try:
             fixed = version.parse(_normalize_ver(info["fixed"]))
             if current < fixed:
-                affected.append(cve_id)
+                if not is_ubuntu_patched(banner, cve_id):
+                    affected.append(cve_id)
         except Exception:
             pass
     return affected
@@ -357,7 +404,7 @@ def scan_ip_ssh(ip: str, hostname: str, ports: list, timeout: float) -> dict | N
             continue
         openssh_ver = parse_openssh_version(banner)
         fabricante, sw_name, sw_ver = detect_ssh_software(banner)
-        affected_cves = check_cves(openssh_ver) if openssh_ver else []
+        affected_cves = check_cves(openssh_ver, banner) if openssh_ver else []
         status = classify_host(banner, openssh_ver, affected_cves)
         return {
             "ip": ip,
