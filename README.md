@@ -185,7 +185,7 @@ sudo systemctl restart sshd
 ## Aviso Legal
 
 Este script é destinado ao uso em sua própria infraestrutura ou sob autorização explícita.
-A varredura não autorizada pode violar diversas legislações — use com responsabilidade.
+A varredura não autorizada pode violar diversas legislações, então use com cautela.
 
 Quaisquer ações e consequências resultantes do uso indevido desta ferramenta são de sua própria responsabilidade.
 
