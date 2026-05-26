@@ -19,8 +19,6 @@ Race condition no handler de sinal `SIGALRM` do servidor OpenSSH permite **RCE n
 
 Prefix truncation attack no handshake SSH (protocolo binário) que permite a um adversário MITM remover mensagens de extensão de segurança negociadas no início da sessão. Afeta OpenSSH < **9.6**.
 
----
-
 ## Como funciona
 
 O script conecta diretamente na porta SSH dos alvos e lê o **banner de identificação** (ex: `SSH-2.0-OpenSSH_9.7`), sem enviar nenhuma credencial. Com a versão em mãos, compara contra as versões fixadas de cada CVE e classifica o host.
@@ -45,8 +43,6 @@ O script também identifica o **fabricante/software SSH** a partir do banner, re
 | `SSH-2.0-WolfSSH_1.4.14`        | wolfSSH                 |
 | Outros não mapeados             | Nome extraído do banner |
 
----
-
 ## Requisitos
 
 ```bash
@@ -54,8 +50,6 @@ pip install requests packaging urllib3 dnspython
 ```
 
 > `dnspython` é opcional, mas altamente recomendado — a resolução reversa paralela é significativamente mais rápida com ele. Sem `dnspython`, o script usa `socket` como fallback.
-
----
 
 ## Utilização
 
@@ -94,8 +88,6 @@ python ssh_scanner.py --cidr 10.0.0.0/24 --ports 22 2222 22222
 | `--no-confirm`  | —      | Pula a confirmação antes de iniciar (útil em automações) |
 
 > A resolução DNS é executada em lote **antes** do scan SSH, com fila dedicada de threads, evitando que a latência do DNS impacte na velocidade da varredura.
-
----
 
 ## Saída
 
@@ -145,8 +137,6 @@ IP               | PORTA | TIMESTAMP_UTC        | DOMINIO                  | FAB
 | `SSH-NÃO-OPENSSH`   | Servidor SSH encontrado mas não é OpenSSH (Dropbear, Cisco, etc.) |
 | `NÃO-SSH`           | Porta respondeu mas o banner não corresponde ao protocolo SSH      |
 
----
-
 ## Remediação
 
 Atualize o OpenSSH para a versão **9.8p1 ou superior** (cobre ambas as CVEs):
@@ -172,15 +162,11 @@ Após atualizar, reinicie o serviço:
 sudo systemctl restart sshd
 ```
 
----
-
 ## Referências
 
 - NVD CVE-2024-6387: <https://nvd.nist.gov/vuln/detail/CVE-2024-6387>
 - NVD CVE-2023-48795: <https://nvd.nist.gov/vuln/detail/CVE-2023-48795>
 - OpenSSH Release Notes: <https://www.openssh.com/releasenotes.html>
-
----
 
 ## Aviso Legal
 
