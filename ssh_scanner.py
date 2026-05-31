@@ -2,7 +2,7 @@
 """
 ssh_scanner.py — Scanner Proativo de Servidores SSH com OpenSSH Possivelmente Vulnerável
 ------------------------------------------------------------------------------------------
-Varre alvos (IPs, CIDRs, ASNs) em busca de instâncias OpenSSH expostas e classifica
+Varre os alvos (IPs, CIDRs, ASNs) em busca de instâncias OpenSSH expostas e classifica
 sua versão em relação às CVEs conhecidas, identificando versões vulneráveis conhecidas:
 CVE-2024-6387 (regreSSHion) — OpenSSH < 9.8p1
 CVE-2023-48795 (Terrapin) — OpenSSH < 9.6
