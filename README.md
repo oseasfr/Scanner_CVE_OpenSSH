@@ -1,6 +1,6 @@
 <img width="810" height="220" alt="image" src="https://github.com/user-attachments/assets/4280eea6-7556-4f35-901c-3ca47d89e971" />
 
-Scanner para identificação de servidores com softwares SSH possivelmente vulnerável às CVEs mais críticas conhecidas.
+Scanner para identificação de servidores com softwares SSH possivelmente vulnerável às CVEs CVE-2024-6387 e CVE-2023-48795.
 
 ---
 
